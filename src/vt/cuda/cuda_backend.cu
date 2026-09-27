@@ -125,7 +125,89 @@ class CudaBackend final : public Backend {
     static const bool e = std::getenv("VT_CUDA_ALLOC_STATS") != nullptr;
     return e;
   }
+  // VT_CUDA_ALLOC_TRACE: print every allocation of at least 16 MiB with its
+  // size, live bytes and free device memory, every free of the same size, and
+  // the request that fails, so a first-forward OOM is a size list rather than a
+  // guess. Zero-cost when unset.
+  static bool AllocTraceEnabled() {
+    static const bool e = [] {
+      const char* v = std::getenv("VT_CUDA_ALLOC_TRACE");
+      return v != nullptr && v[0] != '0';
+    }();
+    return e;
+  }
+  struct AllocTrace {
+    std::mutex mu;
+    std::unordered_map<void*, size_t> sizes;
+    long long live = 0;
+    long long calls = 0;
+  };
+  static AllocTrace& Trace() {
+    static AllocTrace t;
+    return t;
+  }
+  void TraceAlloc(void* p, size_t bytes) {
+    auto& t = Trace();
+    std::lock_guard<std::mutex> lk(t.mu);
+    t.sizes[p] = bytes;
+    t.live += static_cast<long long>(bytes);
+    const long long live = t.live;
+    const long long n = ++t.calls;
+    size_t free_b = 0, tot_b = 0;
+    DeviceMemoryInfo(&free_b, &tot_b);
+    const double mib = 1024.0 * 1024.0;
+    if (bytes >= (16ULL << 20) || free_b < (2ULL << 30)) {
+      std::fprintf(stderr,
+                   "[cuda-alloc] #%lld size=%.1f MiB live=%.2f GiB free=%.2f GiB\n",
+                   n, static_cast<double>(bytes) / mib,
+                   static_cast<double>(live) / (1024.0 * mib),
+                   static_cast<double>(free_b) / (1024.0 * mib));
+      std::fflush(stderr);
+    }
+  }
+  void TraceFree(void* p) {
+    auto& t = Trace();
+    size_t bytes = 0;
+    long long live = 0;
+    {
+      std::lock_guard<std::mutex> lk(t.mu);
+      auto it = t.sizes.find(p);
+      if (it == t.sizes.end()) return;
+      bytes = it->second;
+      t.sizes.erase(it);
+      t.live -= static_cast<long long>(bytes);
+      live = t.live;
+    }
+    size_t free_b = 0, tot_b = 0;
+    DeviceMemoryInfo(&free_b, &tot_b);
+    const double mib = 1024.0 * 1024.0;
+    if (bytes >= (16ULL << 20)) {
+      std::fprintf(stderr,
+                   "[cuda-free]  size=%.1f MiB live=%.2f GiB free=%.2f GiB\n",
+                   static_cast<double>(bytes) / mib,
+                   static_cast<double>(live) / (1024.0 * mib),
+                   static_cast<double>(free_b) / (1024.0 * mib));
+      std::fflush(stderr);
+    }
+  }
   void* Alloc(size_t bytes) override {
+    if (AllocTraceEnabled()) {
+      void* p = nullptr;
+      cudaError_t err = cudaMalloc(&p, bytes);
+      if (err != cudaSuccess) {
+        size_t free_b = 0, tot_b = 0;
+        DeviceMemoryInfo(&free_b, &tot_b);
+        std::fprintf(stderr,
+                     "[cuda-alloc] FAILED size=%.1f MiB free=%.2f GiB err=%s\n",
+                     static_cast<double>(bytes) / (1024.0 * 1024.0),
+                     static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0),
+                     cudaGetErrorString(err));
+        std::fflush(stderr);
+        Check(err, "cudaMalloc");
+      }
+      TraceAlloc(p, bytes);
+      return p;
+    }
     void* p = nullptr;
     Check(cudaMalloc(&p, bytes), "cudaMalloc");
     if (StatsEnabled()) {
@@ -135,6 +217,7 @@ class CudaBackend final : public Backend {
   }
   void Free(void* p) override {
     if (p == nullptr) return;
+    if (AllocTraceEnabled()) TraceFree(p);
     Check(cudaFree(p), "cudaFree");
     if (StatsEnabled()) {
       Stats().frees.fetch_add(1, std::memory_order_relaxed);

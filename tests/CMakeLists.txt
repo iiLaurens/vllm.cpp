@@ -2831,6 +2831,9 @@ if(TARGET vllm_shared)
   endif()
 endif()
 vllm_cpp_add_test(test_cuda_backend vt/test_cuda_backend.cpp)
+# BACKEND-CUDA-SM120: VT_CUDA_ALLOC_TRACE prints each large cudaMalloc/cudaFree
+# with the live-bytes and free-memory curves, and the request that fails.
+vllm_cpp_add_test(test_cuda_alloc_trace vt/test_cuda_alloc_trace.cpp)
 vllm_cpp_add_test(test_dropin_abi vt/test_dropin_abi.cpp)
 target_include_directories(test_dropin_abi PRIVATE ${CMAKE_SOURCE_DIR}/src)
 vllm_cpp_add_test(test_cuda_ops vt/test_cuda_ops.cpp)
