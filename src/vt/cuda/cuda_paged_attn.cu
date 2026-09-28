@@ -31,6 +31,7 @@
 #include <math_constants.h>
 #include <mma.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -186,11 +187,10 @@ __device__ __forceinline__ float Fp8E4M3ToF32Dev(uint8_t byte) {
   return sm * ldexpf(mantissa, static_cast<int>(exp) - 7);
 }
 
-// Hardware fp8->bf16 for the staging hot path. `__nv_cvt_fp8_to_halfraw` is one
-// instruction, and every e4m3 value (subnormals included) is exactly
-// representable in bf16 — 4 significant bits against 8 — so this is
-// bit-identical to `Fp8E4M3ToF32Dev` + rounding, at a fraction of the cost. The
-// staging loop runs once per K/V re-stream, which is the fp8 prefill's hot path.
+// Hardware fp8->bf16. `__nv_cvt_fp8_to_halfraw` is one instruction and every
+// e4m3 value (subnormals included) is exactly representable in bf16 — 4
+// significant bits against 8 — so this matches the software decode above at a
+// fraction of the cost.
 __device__ __forceinline__ __nv_bfloat16 Fp8E4M3ToBf16Dev(uint8_t byte) {
   return __float2bfloat16(__half2float(__nv_cvt_fp8_to_halfraw(byte, __NV_E4M3)));
 }
@@ -1558,9 +1558,7 @@ __global__ void PagedFlashWmmaGqaFlash2Kernel(Tout* out, const TQ* query, const 
 //   [QG,16,BN] (both heads' QKᵀ land before the batched softmax).
 // ===========================================================================
 template <typename TKV>
-__device__ __forceinline__ void StageKeyBf16(__nv_bfloat16* dst, const TKV* base, int d, int lane,
-                                             float scale = 1.0f) {
-  (void)scale;  // used only by the fp8 branch
+__device__ __forceinline__ void StageKeyBf16(__nv_bfloat16* dst, const TKV* base, int d, int lane) {
   if constexpr (std::is_same<TKV, __nv_bfloat16>::value) {
     // 128-bit vectorized copy: d % 16 == 0 (WMMA gate) => d % 8 == 0; the paged
     // base offset is a multiple of head_dim (contiguous NHD cache) => 16B-aligned.
@@ -1568,30 +1566,6 @@ __device__ __forceinline__ void StageKeyBf16(__nv_bfloat16* dst, const TKV* base
     int4* d4 = reinterpret_cast<int4*>(dst);
     const int n4 = d >> 3;
     for (int i = lane; i < n4; i += 32) d4[i] = s4[i];
-  } else if constexpr (std::is_same<TKV, uint8_t>::value) {
-    // fp8-e4m3 cache -> bf16 tile, dequantized ON LOAD with the per-tensor scale
-    // (upstream `_cast_kv_tile`, triton_unified_attention.py:39-56). 16-byte
-    // vectorized source read: d % 16 == 0 is the WMMA gate and the paged base is
-    // head_dim-aligned, so the fp8 row start is 16B-aligned. 16 fp8 values become
-    // 32 bytes of bf16 (two uint4 stores).
-    const uint4* s4 = reinterpret_cast<const uint4*>(base);
-    const int n4 = d >> 4;
-    const bool unit_scale = (scale == 1.0f);
-    for (int i = lane; i < n4; i += 32) {
-      const uint4 raw = s4[i];
-      const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&raw);
-      alignas(16) __nv_bfloat16 tmp[16];
-#pragma unroll
-      for (int j = 0; j < 16; ++j)
-        tmp[j] = unit_scale
-                     ? Fp8E4M3ToBf16Dev(bytes[j])
-                     : __float2bfloat16(__half2float(
-                           __nv_cvt_fp8_to_halfraw(bytes[j], __NV_E4M3)) * scale);
-      const uint4* t4 = reinterpret_cast<const uint4*>(tmp);
-      uint4* d4 = reinterpret_cast<uint4*>(dst + (i << 4));
-      d4[0] = t4[0];
-      d4[1] = t4[1];
-    }
   } else {
     for (int e = lane; e < d; e += 32) dst[e] = __float2bfloat16(Load(base, e));
   }
@@ -1607,7 +1581,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
                                                  int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                                  int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                                  float scale, float softcap, bool causal, int window_left,
-                                                 int window_right, float k_scale, float v_scale) {
+                                                 int window_right) {
 #if __CUDA_ARCH__ >= 800  // bf16 WMMA body is Ampere+; <sm_80 uses scalar fallback (byte-identical on sm_80+)
   const int tile_idx = blockIdx.x;
   const int grp = blockIdx.y;
@@ -1688,7 +1662,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
         const int off = j % block_size;
         const TKV* src = k_cache + static_cast<int64_t>(blk) * kc_blk +
                          static_cast<int64_t>(off) * kc_pg + static_cast<int64_t>(g) * kc_hd;
-        StageKeyBf16<TKV>(dst, src, d, lane, k_scale);
+        StageKeyBf16<TKV>(dst, src, d, lane);
       } else {
         for (int e = lane; e < d; e += 32) dst[e] = __float2bfloat16(0.0f);
       }
@@ -1768,7 +1742,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecKernel(Tout* out, const TQ* query, con
         const int off = j % block_size;
         const TKV* src = v_cache + static_cast<int64_t>(blk) * vc_blk +
                          static_cast<int64_t>(off) * vc_pg + static_cast<int64_t>(g) * vc_hd;
-        StageKeyBf16<TKV>(dst, src, d, lane, v_scale);
+        StageKeyBf16<TKV>(dst, src, d, lane);
       } else {
         for (int e = lane; e < d; e += 32) dst[e] = __float2bfloat16(0.0f);
       }
@@ -1851,7 +1825,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
                                                    int64_t kc_blk, int64_t kc_pg, int64_t kc_hd,
                                                    int64_t vc_blk, int64_t vc_pg, int64_t vc_hd,
                                                    float scale, float softcap, bool causal, int window_left,
-                                                   int window_right, float k_scale, float v_scale) {
+                                                   int window_right) {
 #if __CUDA_ARCH__ >= 800  // bf16 WMMA body is Ampere+; <sm_80 uses scalar fallback (byte-identical on sm_80+)
   constexpr int BM = MT * kWmmaM;  // query rows per block (MT WMMA M-tiles)
   const int tile_idx = blockIdx.x;
@@ -1935,7 +1909,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
         const int off = j % block_size;
         const TKV* src = k_cache + static_cast<int64_t>(blk) * kc_blk +
                          static_cast<int64_t>(off) * kc_pg + static_cast<int64_t>(g) * kc_hd;
-        StageKeyBf16<TKV>(dst, src, d, lane, k_scale);
+        StageKeyBf16<TKV>(dst, src, d, lane);
       } else {
         for (int e = lane; e < d; e += 32) dst[e] = __float2bfloat16(0.0f);
       }
@@ -2017,7 +1991,7 @@ __global__ void PagedFlashWmmaGqaFlash2VecBMKernel(Tout* out, const TQ* query, c
         const int off = j % block_size;
         const TKV* src = v_cache + static_cast<int64_t>(blk) * vc_blk +
                          static_cast<int64_t>(off) * vc_pg + static_cast<int64_t>(g) * vc_hd;
-        StageKeyBf16<TKV>(dst, src, d, lane, v_scale);
+        StageKeyBf16<TKV>(dst, src, d, lane);
       } else {
         for (int e = lane; e < d; e += 32) dst[e] = __float2bfloat16(0.0f);
       }
@@ -2510,8 +2484,7 @@ void LaunchPrefillWmmaGqaFlash2Vec(cudaStream_t s, Tensor& out, const Tensor& qu
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args),
-      args.k_scale, args.v_scale);
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2vec launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2vec tiles free");
 }
@@ -2553,8 +2526,7 @@ void LaunchPrefillWmmaGqaFlash2VecBM(cudaStream_t s, Tensor& out, const Tensor& 
       num_tiles, static_cast<int>(hq), static_cast<int>(num_kv_heads), static_cast<int>(d),
       static_cast<int>(block_size), block_table.stride[0], block_table.stride[1], k_cache.stride[0],
       k_cache.stride[1], k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
-      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args),
-      args.k_scale, args.v_scale);
+      args.scale, args.logits_soft_cap, args.causal, WindowLeft(args), WindowRight(args));
   Check(cudaGetLastError(), "paged_attention prefill wmma-flash2vec-bm launch");
   Check(cudaFreeAsync(d_tiles, s), "paged wmma-flash2vec-bm tiles free");
 }
@@ -2616,13 +2588,11 @@ bool PrefillFlash2VecEnabled() {
   return enabled;
 }
 
-// fp8 KV through the bf16 tensor-core prefill ladder, dequantized ON LOAD with
-// the per-tensor k/v scales (upstream Triton `_cast_kv_tile`,
-// triton_unified_attention.py:39-56). Default ON; VT_ATTN_FP8_WMMA=0 restores
-// the scalar flash kernel for a same-binary A/B.
-bool PrefillFp8WmmaEnabled() {
+// fp8 KV prefill via the one-time dense dequant scratch. Default ON;
+// VT_ATTN_FP8_DENSE=0 restores the per-read dequant for a same-binary A/B.
+bool PrefillFp8DenseEnabled() {
   static const bool enabled = [] {
-    const char* e = std::getenv("VT_ATTN_FP8_WMMA");
+    const char* e = std::getenv("VT_ATTN_FP8_DENSE");
     return !(e != nullptr && e[0] == '0');
   }();
   return enabled;
@@ -3143,15 +3113,78 @@ void LaunchPaged(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor&
 // read is dequantized as Dequant(fp8) * k_scale|v_scale inside LoadKv, mirroring
 // upstream's `scaled_vec_conversion<float, uint8_t>` (quant_utils.cuh:419-429).
 //
-// SCOPE. The tensor-core fp8 read is wired for PREFILL: `StageKeyBf16<uint8_t>`
-// dequantizes fp8->bf16 with k/v_scale while staging the K/V tile, so the bf16
-// WMMA ladder serves the fp8 cache exactly as upstream's Triton kernel serves it
-// (`_cast_kv_tile`). Everything else keeps the correctness-grade kernels: the
-// vendored FA-2 launchers take bf16 pointers only, and the vectorized
-// decode-opt/GQA kernels read the cache through LoadRowN/LoadRow8, which are
-// 128-bit `uint4` loads specialized for bf16 and f32 — a native fp8 decode read
-// is a separate brick, and decode is bandwidth-bound so the dequant-in-register
-// block kernel is already the right shape there. The block decode below stays.
+// SCOPE, argued rather than assumed. Only the two CORRECTNESS-GRADE kernels are
+// reachable from here — the tiled flash prefill and the block decode — and that
+// is not a shortcut, it is what the ladder above already implies. Every faster
+// arm is bf16-NATIVE by construction: the WMMA prefill ladder stages
+// `__nv_bfloat16` fragments, the vendored FA-2 launchers take bf16 pointers, and
+// the vectorized decode-opt/GQA kernels read the cache through LoadRowN/LoadRow8,
+// which are 128-bit `uint4` loads specialized for bf16 and f32 only. Upstream
+// draws the same line from the other side: FlashAttention only serves a
+// quantized KV cache when `flash_attn_supports_kv_cache_dtype` says so
+// (flash_attn.py:181-187,796-805) and otherwise the backend refuses. A tensor-
+// core fp8 read is a PERFORMANCE brick, not this one; W2's gate is parity with
+// the W1 CPU reference, and W4 owns the memory/throughput measurement.
+// fp8 paged cache -> bf16 DENSE (per request). The tensor-core prefill re-reads
+// K/V once per query tile, so dequantizing inside the staging loop pays the
+// conversion thousands of times per element; this pays it ONCE per layer. One
+// block per (request, key position), `blockIdx.y` selects the KV head, 16-byte
+// vector reads, and the k/v scales are applied here.
+__global__ void Fp8PagedToDenseBf16Kernel(const uint8_t* k_cache, const uint8_t* v_cache,
+                                          __nv_bfloat16* k_dense, __nv_bfloat16* v_dense,
+                                          const int32_t* block_table, const int32_t* seq_lens,
+                                          int max_seq, int hk, int d, int block_size,
+                                          int64_t bt_row, int64_t bt_col, int64_t kc_blk,
+                                          int64_t kc_pg, int64_t kc_hd, int64_t vc_blk,
+                                          int64_t vc_pg, int64_t vc_hd, float k_scale,
+                                          float v_scale) {
+  const int64_t t = blockIdx.x;
+  const int r = static_cast<int>(t / max_seq);
+  const int j = static_cast<int>(t % max_seq);
+  const int g = blockIdx.y;
+  if (j >= seq_lens[r]) return;
+  const int blk =
+      block_table[static_cast<int64_t>(r) * bt_row + (j / block_size) * bt_col];
+  const int off = j % block_size;
+  const uint8_t* ksrc = k_cache + static_cast<int64_t>(blk) * kc_blk +
+                        static_cast<int64_t>(off) * kc_pg + static_cast<int64_t>(g) * kc_hd;
+  const uint8_t* vsrc = v_cache + static_cast<int64_t>(blk) * vc_blk +
+                        static_cast<int64_t>(off) * vc_pg + static_cast<int64_t>(g) * vc_hd;
+  __nv_bfloat16* kdst =
+      k_dense + (static_cast<int64_t>(r) * max_seq + j) * hk * d + static_cast<int64_t>(g) * d;
+  __nv_bfloat16* vdst =
+      v_dense + (static_cast<int64_t>(r) * max_seq + j) * hk * d + static_cast<int64_t>(g) * d;
+  const int n4 = d >> 4;
+  const bool k_unit = (k_scale == 1.0f);
+  const bool v_unit = (v_scale == 1.0f);
+  for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+    const uint4 raw_k = reinterpret_cast<const uint4*>(ksrc)[i];
+    const uint4 raw_v = reinterpret_cast<const uint4*>(vsrc)[i];
+    const uint8_t* kb = reinterpret_cast<const uint8_t*>(&raw_k);
+    const uint8_t* vb = reinterpret_cast<const uint8_t*>(&raw_v);
+    alignas(16) __nv_bfloat16 tk[16], tv[16];
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+      tk[e] = k_unit
+                  ? Fp8E4M3ToBf16Dev(kb[e])
+                  : __float2bfloat16(__half2float(__nv_cvt_fp8_to_halfraw(kb[e], __NV_E4M3)) *
+                                     k_scale);
+      tv[e] = v_unit
+                  ? Fp8E4M3ToBf16Dev(vb[e])
+                  : __float2bfloat16(__half2float(__nv_cvt_fp8_to_halfraw(vb[e], __NV_E4M3)) *
+                                     v_scale);
+    }
+    const uint4* tk4 = reinterpret_cast<const uint4*>(tk);
+    const uint4* tv4 = reinterpret_cast<const uint4*>(tv);
+    uint4* kd4 = reinterpret_cast<uint4*>(kdst + (i << 4));
+    uint4* vd4 = reinterpret_cast<uint4*>(vdst + (i << 4));
+    kd4[0] = tk4[0];
+    kd4[1] = tk4[1];
+    vd4[0] = tv4[0];
+    vd4[1] = tv4[1];
+  }
+}
+
 template <typename TQ, typename Tout>
 void LaunchPagedFp8Out(cudaStream_t s, Tensor& out, const Tensor& query, const Tensor& k_cache,
                        const Tensor& v_cache, const Tensor& block_table, const Tensor& seq_lens,
@@ -3163,26 +3196,88 @@ void LaunchPagedFp8Out(cudaStream_t s, Tensor& out, const Tensor& query, const T
   // Same predicate LaunchPaged uses to pick the tiled prefill kernel.
   const bool is_prefill = num_tokens > num_reqs;
   if (is_prefill && d <= kMaxEpl * 32 && PrefillFlashEnabled()) {
-    // fp8 KV on the bf16 tensor-core ladder, dequantized ON LOAD. Same shape
-    // gates as the bf16 ladder, except the QUERY: the 27B preamble hands
-    // PagedAttention an f32 query ("the query stays f32 for PagedAttention"), and
-    // the kernel stages it into the bf16 Q tile exactly as the bf16-query path
-    // does, so both dtypes are admitted here. Anything outside the shape gates
-    // keeps the scalar flash kernel. VT_ATTN_FP8_WMMA=0 restores that kernel for
-    // an A/B.
-    const int64_t qpk = (num_kv_heads > 0) ? hq / num_kv_heads : 0;
-    const bool wmma = d == 256 && GetDeviceCaps().sm_major >= 8 && PrefillWmmaEnabled() &&
-                      (std::is_same<TQ, __nv_bfloat16>::value ||
-                       std::is_same<TQ, float>::value);
-    const bool gqa = wmma && PrefillWmmaGqaEnabled() && num_kv_heads > 0 &&
-                     qpk % kGqaQG == 0 && hq % kGqaQG == 0;
-    const bool flash2vec = gqa && PrefillWmmaFlash2Enabled() && PrefillFlash2VecEnabled() &&
-                           PrefillFp8WmmaEnabled();
-    if (flash2vec) {
-      DispatchPrefillFlash2Vec<TQ, uint8_t, Tout>(s, out, query, k_cache, v_cache, block_table,
-                                                  seq_lens, query_start_loc, args, hq, d, num_reqs,
-                                                  num_kv_heads, block_size);
-      return;
+    // fp8 KV prefill: dequantize the cache ONCE per layer into a dense bf16
+    // scratch, then run the SAME flash kernel a bf16 cache runs. Dequantizing
+    // inside the kernel's K/V staging pays the conversion once per K/V re-stream
+    // (~8000x per KV head at 32k/BM=16), which is what made fp8 prefill 3.7x
+    // slower than bf16; the scratch makes the attention cost identical to a bf16
+    // cache while the resident cache stays 1 byte/element. The scratch is laid out
+    // as ONE BLOCK PER REQUEST with block_size = max_seq and an identity block
+    // table, so the kernel's paged address (blk*kc_blk + off*kc_pg + g*kc_hd) IS
+    // the dense address and the kernel is untouched. The dequant is exact for
+    // e4m3 (bf16 holds every value), so tokens match the per-read path.
+    // VT_ATTN_FP8_DENSE=0 restores that path for an A/B.
+    if (PrefillFp8DenseEnabled() && d % 16 == 0) {
+      std::vector<int32_t> sl(static_cast<size_t>(num_reqs));
+      Check(cudaMemcpyAsync(sl.data(), seq_lens.Ptr<int32_t>(),
+                            static_cast<size_t>(num_reqs) * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, s),
+            "fp8 prefill seq_lens D2H");
+      Check(cudaStreamSynchronize(s), "fp8 prefill seq_lens sync");
+      const int64_t max_seq = *std::max_element(sl.begin(), sl.end());
+      if (max_seq > 0) {
+        const size_t dense_bytes = static_cast<size_t>(num_reqs) *
+                                   static_cast<size_t>(max_seq) *
+                                   static_cast<size_t>(num_kv_heads) *
+                                   static_cast<size_t>(d) * sizeof(__nv_bfloat16);
+        uint8_t* dense = nullptr;
+        Check(cudaMallocAsync(&dense, dense_bytes * 2, s), "fp8 prefill dense scratch");
+        int32_t* d_ids = nullptr;
+        Check(cudaMallocAsync(&d_ids, static_cast<size_t>(num_reqs) * sizeof(int32_t), s),
+              "fp8 prefill identity table");
+        std::vector<int32_t> ids(static_cast<size_t>(num_reqs));
+        for (int64_t r = 0; r < num_reqs; ++r)
+          ids[static_cast<size_t>(r)] = static_cast<int32_t>(r);
+        Check(cudaMemcpyAsync(d_ids, ids.data(), static_cast<size_t>(num_reqs) * sizeof(int32_t),
+                              cudaMemcpyHostToDevice, s),
+              "fp8 prefill identity table H2D");
+        const dim3 dense_grid(static_cast<unsigned>(num_reqs * max_seq),
+                              static_cast<unsigned>(num_kv_heads));
+        Fp8PagedToDenseBf16Kernel<<<dense_grid, 32, 0, s>>>(
+            k_cache.Ptr<uint8_t>(), v_cache.Ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(dense),
+            reinterpret_cast<__nv_bfloat16*>(dense + dense_bytes),
+            block_table.Ptr<int32_t>(), seq_lens.Ptr<int32_t>(), static_cast<int>(max_seq),
+            static_cast<int>(num_kv_heads), static_cast<int>(d), static_cast<int>(block_size),
+            block_table.stride[0], block_table.stride[1], k_cache.stride[0], k_cache.stride[1],
+            k_cache.stride[2], v_cache.stride[0], v_cache.stride[1], v_cache.stride[2],
+            args.k_scale, args.v_scale);
+        Check(cudaGetLastError(), "fp8 prefill dense dequant launch");
+        Tensor kd{};
+        kd.data = dense;
+        kd.dtype = DType::kBF16;
+        kd.device = k_cache.device;
+        kd.rank = 4;
+        kd.shape[0] = num_reqs;
+        kd.shape[1] = max_seq;
+        kd.shape[2] = num_kv_heads;
+        kd.shape[3] = d;
+        kd.stride[0] = max_seq * num_kv_heads * d;
+        kd.stride[1] = num_kv_heads * d;
+        kd.stride[2] = d;
+        kd.stride[3] = 1;
+        Tensor vd = kd;
+        vd.data = dense + dense_bytes;
+        Tensor idt{};
+        idt.data = d_ids;
+        idt.dtype = DType::kI32;
+        idt.device = k_cache.device;
+        idt.rank = 2;
+        idt.shape[0] = num_reqs;
+        idt.shape[1] = 1;
+        idt.stride[0] = 1;
+        idt.stride[1] = 1;
+        // The standard bf16 dispatch, not the scalar flash directly: TQ/out are
+        // bf16 (the model presents bf16 for the fp8 store) and the scratch is
+        // bf16, which is exactly the vendored FA-2 prefill admission. Falling
+        // back to the WMMA ladder when FA-2 is not compiled is the same call's
+        // own ladder, so this is one dispatch either way.
+        LaunchPaged<TQ, __nv_bfloat16>(s, out, query, kd, vd, idt, seq_lens,
+                                       query_start_loc, args);
+        Check(cudaFreeAsync(d_ids, s), "fp8 prefill identity table free");
+        Check(cudaFreeAsync(dense, s), "fp8 prefill dense scratch free");
+        return;
+      }
     }
     LaunchPrefillFlash<TQ, uint8_t, Tout>(s, out, query, k_cache, v_cache, block_table, seq_lens,
                                           query_start_loc, args, hq, d, num_reqs, num_kv_heads,

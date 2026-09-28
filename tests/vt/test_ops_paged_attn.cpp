@@ -1068,15 +1068,16 @@ TEST_CASE("paged_attention CUDA WMMA (bf16 cache) matches f32 ref at head_dim 25
 }
 
 // ===========================================================================
-// fp8-KV PREFILL on the tensor-core ladder. The 1-byte fp8 cache is dequantized
-// ON LOAD (`StageKeyBf16<uint8_t>`, the port of upstream's `_cast_kv_tile`), so
-// the SAME WMMA kernels that serve a bf16 cache serve an fp8 one instead of the
-// scalar CUDA-core flash kernel. The reference runs on the DEQUANTIZED fp8
-// values, so the only error left is the kernel's bf16 compute rounding — the
-// same envelope the bf16-cache case above pins at 5e-2. The default dispatch
-// takes this path (VT_ATTN_FP8_WMMA=0 restores the scalar flash kernel).
+// fp8-KV PREFILL through the one-time dense dequant. The op dequantizes the
+// 1-byte cache ONCE per call into a dense bf16 scratch (the K/V re-stream in the
+// attention kernel would otherwise pay the conversion per pass) and then runs
+// the standard bf16 dispatch on it. This call presents an f32 query, so the
+// bf16 dispatch takes its CUDA-core flash arm on the scratch; the ENGINE
+// presents bf16 for an fp8 store, which is what admits the vendored FA-2. The
+// reference runs on the dequantized fp8 values, so the error is only the
+// flash kernel's own rounding (VT_ATTN_FP8_DENSE=0 restores the per-read path).
 // ===========================================================================
-TEST_CASE("paged_attention CUDA fp8-KV prefill (WMMA dequant-on-load) matches f32 ref at head_dim 256") {
+TEST_CASE("paged_attention CUDA fp8-KV prefill (one-time dense dequant) matches f32 ref at head_dim 256") {
   if (!HasCuda()) {
     MESSAGE("no CUDA backend; skipping paged_attention fp8-KV WMMA parity (dgx-pending)");
     return;

@@ -6030,7 +6030,12 @@ DBuf FullAttnBlockPaged(Dev d, const FullAttnLayerWeights& w, const HfConfig& cf
       /*num_reqs=*/meta.num_reqs,
       /*uniform_spec_query_len=*/meta.uniform_spec_query_len,
       /*causal=*/meta.causal,
-      /*kv_cache_bf16=*/kv.dtype == DType::kBF16,
+      // The fp8 store is served through a bf16 dense scratch (the prefill
+      // dequant), so it presents bf16 as well: FA-2 consumes that scratch and
+      // the model must hand it a bf16 query/out or the lane dies at the dtype
+      // conjunct and silently falls to the scalar CUDA-core flash. The fp8
+      // DECODE lanes keep their own admission.
+      /*kv_cache_bf16=*/kv.dtype == DType::kBF16 || dense_attn::IsFp8KvCache(kv),
       /*kv_block_multiple_16=*/kv.block_size % 16 == 0,
       /*preamble_with_cos_sin=*/FuseAttnPreambleOn(fp4) && sdi.has_attn_cos_sin,
       /*fa2_platform=*/fa2_platform,

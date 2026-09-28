@@ -2905,6 +2905,12 @@ target_include_directories(vllm_music3_vocoder_conv_ab SYSTEM PRIVATE
 target_compile_features(vllm_music3_vocoder_conv_ab PRIVATE cxx_std_20)
 vllm_cpp_set_warnings(vllm_music3_vocoder_conv_ab)
 
+# Paged-attention prefill A/B (paged vs dense KV source, bf16 vs fp8 cache).
+add_executable(vllm_paged_attn_prefill_ab benchmarks/paged_attn_prefill_ab.cpp)
+target_link_libraries(vllm_paged_attn_prefill_ab PRIVATE vllm)
+target_compile_features(vllm_paged_attn_prefill_ab PRIVATE cxx_std_20)
+vllm_cpp_set_warnings(vllm_paged_attn_prefill_ab)
+
 # ── The `vt::Conv1d` decomposition probe (#672, #1334) ───────────────────────
 # `tools/bench/conv1d_scaling_probe.cpp` is the instrument behind the scaling
 # curve and the residency ablation in `.agents/specs/vt-conv1d-time-block.md`.
