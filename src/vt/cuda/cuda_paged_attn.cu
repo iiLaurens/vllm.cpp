@@ -26,6 +26,7 @@
 // Prefill is never CUDA-graph-captured (see cuda_matmul_nvfp4.cu), so the
 // launcher may read query_start_loc D2H to build per-request query tiles.
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <mma.h>
@@ -183,6 +184,15 @@ __device__ __forceinline__ float Fp8E4M3ToF32Dev(uint8_t byte) {
   if (exp == 0U) return sm * (static_cast<float>(mant) * (1.0f / 512.0f));
   const float mantissa = 1.0f + static_cast<float>(mant) * (1.0f / 8.0f);
   return sm * ldexpf(mantissa, static_cast<int>(exp) - 7);
+}
+
+// Hardware fp8->bf16 for the staging hot path. `__nv_cvt_fp8_to_halfraw` is one
+// instruction, and every e4m3 value (subnormals included) is exactly
+// representable in bf16 — 4 significant bits against 8 — so this is
+// bit-identical to `Fp8E4M3ToF32Dev` + rounding, at a fraction of the cost. The
+// staging loop runs once per K/V re-stream, which is the fp8 prefill's hot path.
+__device__ __forceinline__ __nv_bfloat16 Fp8E4M3ToBf16Dev(uint8_t byte) {
+  return __float2bfloat16(__half2float(__nv_cvt_fp8_to_halfraw(byte, __NV_E4M3)));
 }
 
 __device__ inline float LoadKv(const float* p, int64_t i, float scale) {
@@ -1566,13 +1576,17 @@ __device__ __forceinline__ void StageKeyBf16(__nv_bfloat16* dst, const TKV* base
     // 32 bytes of bf16 (two uint4 stores).
     const uint4* s4 = reinterpret_cast<const uint4*>(base);
     const int n4 = d >> 4;
+    const bool unit_scale = (scale == 1.0f);
     for (int i = lane; i < n4; i += 32) {
       const uint4 raw = s4[i];
       const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&raw);
       alignas(16) __nv_bfloat16 tmp[16];
 #pragma unroll
       for (int j = 0; j < 16; ++j)
-        tmp[j] = __float2bfloat16(Fp8E4M3ToF32Dev(bytes[j]) * scale);
+        tmp[j] = unit_scale
+                     ? Fp8E4M3ToBf16Dev(bytes[j])
+                     : __float2bfloat16(__half2float(
+                           __nv_cvt_fp8_to_halfraw(bytes[j], __NV_E4M3)) * scale);
       const uint4* t4 = reinterpret_cast<const uint4*>(tmp);
       uint4* d4 = reinterpret_cast<uint4*>(dst + (i << 4));
       d4[0] = t4[0];
