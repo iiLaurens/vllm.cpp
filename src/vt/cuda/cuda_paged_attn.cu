@@ -32,6 +32,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -107,6 +108,54 @@ void Check(cudaError_t err, const char* what) {
 }
 
 cudaStream_t AsStream(const Queue& q) { return static_cast<cudaStream_t>(q.handle); }
+
+// ─── Test-only fault injection for the fp8 dense-prefill scratch ────────────
+// The OWNERSHIP of that scratch is what the release-on-unwind cases prove, and
+// the failures they need to inject are CUDA failures a healthy device never
+// produces on demand. Two independent bits, armed only through
+// `vt::cuda::testing` (defined at the bottom of this file); production code
+// never sets them.
+constexpr int kFp8DenseFailIdentityAlloc = 1 << 0;
+constexpr int kFp8DenseFailIdentityCopy = 1 << 1;
+
+std::atomic<int>& Fp8DenseFailpoints() {
+  static std::atomic<int> failpoints{0};
+  return failpoints;
+}
+
+bool Fp8DenseFailpointArmed(int failpoint) {
+  return (Fp8DenseFailpoints().load(std::memory_order_relaxed) & failpoint) != 0;
+}
+
+// OWNER for a stream-ordered scratch allocation. The destructor frees on the
+// SAME stream the consumers were enqueued on, so the free is ordered behind
+// them, and it runs while an exception unwinds — the case the explicit frees at
+// the end of a success path cannot reach.
+//
+// The destructor must not throw: `Check` here would replace the exception
+// already in flight (or terminate, during unwinding), which is the failure this
+// guard exists to prevent. A failed free is therefore dropped; the success path
+// still checks its OWN frees explicitly through `release()`.
+class StreamScratch {
+ public:
+  StreamScratch(cudaStream_t stream, void* ptr) : stream_(stream), ptr_(ptr) {}
+  ~StreamScratch() {
+    if (ptr_ != nullptr) (void)cudaFreeAsync(ptr_, stream_);
+  }
+  StreamScratch(const StreamScratch&) = delete;
+  StreamScratch& operator=(const StreamScratch&) = delete;
+
+  // Hands ownership back so the caller can check the free explicitly.
+  void* release() {
+    void* p = ptr_;
+    ptr_ = nullptr;
+    return p;
+  }
+
+ private:
+  cudaStream_t stream_;
+  void* ptr_;
+};
 
 // Opt a kernel into more dynamic shared memory than the 48 KiB every CUDA
 // architecture guarantees without an opt-in.
@@ -3201,15 +3250,29 @@ void LaunchPagedFp8Out(cudaStream_t s, Tensor& out, const Tensor& query, const T
                                    static_cast<size_t>(d) * sizeof(__nv_bfloat16);
         uint8_t* dense = nullptr;
         Check(cudaMallocAsync(&dense, dense_bytes * 2, s), "fp8 prefill dense scratch");
+        // Every later step can throw — the identity allocation and copy, the
+        // dequant launch, the bf16 dispatch it feeds, and the vectors between
+        // them — so each allocation is owned by a scope guard the moment it
+        // exists. On the success path the frees are still explicit and checked.
+        StreamScratch dense_scratch(s, dense);
         int32_t* d_ids = nullptr;
-        Check(cudaMallocAsync(&d_ids, static_cast<size_t>(num_reqs) * sizeof(int32_t), s),
-              "fp8 prefill identity table");
+        if (Fp8DenseFailpointArmed(kFp8DenseFailIdentityAlloc)) {
+          Check(cudaErrorMemoryAllocation, "fp8 prefill identity table");
+        } else {
+          Check(cudaMallocAsync(&d_ids, static_cast<size_t>(num_reqs) * sizeof(int32_t), s),
+                "fp8 prefill identity table");
+        }
+        StreamScratch ids_scratch(s, d_ids);
         std::vector<int32_t> ids(static_cast<size_t>(num_reqs));
         for (int64_t r = 0; r < num_reqs; ++r)
           ids[static_cast<size_t>(r)] = static_cast<int32_t>(r);
-        Check(cudaMemcpyAsync(d_ids, ids.data(), static_cast<size_t>(num_reqs) * sizeof(int32_t),
-                              cudaMemcpyHostToDevice, s),
-              "fp8 prefill identity table H2D");
+        if (Fp8DenseFailpointArmed(kFp8DenseFailIdentityCopy)) {
+          Check(cudaErrorMemoryAllocation, "fp8 prefill identity table H2D");
+        } else {
+          Check(cudaMemcpyAsync(d_ids, ids.data(), static_cast<size_t>(num_reqs) * sizeof(int32_t),
+                                cudaMemcpyHostToDevice, s),
+                "fp8 prefill identity table H2D");
+        }
         const dim3 dense_grid(static_cast<unsigned>(num_reqs * max_seq),
                               static_cast<unsigned>(num_kv_heads));
         Fp8PagedToDenseBf16Kernel<<<dense_grid, 32, 0, s>>>(
@@ -3250,8 +3313,8 @@ void LaunchPagedFp8Out(cudaStream_t s, Tensor& out, const Tensor& query, const T
         // serves the fp8 cache through the scratch.
         LaunchPaged<TQ, __nv_bfloat16>(s, out, query, kd, vd, idt, seq_lens,
                                        query_start_loc, args);
-        Check(cudaFreeAsync(d_ids, s), "fp8 prefill identity table free");
-        Check(cudaFreeAsync(dense, s), "fp8 prefill dense scratch free");
+        Check(cudaFreeAsync(ids_scratch.release(), s), "fp8 prefill identity table free");
+        Check(cudaFreeAsync(dense_scratch.release(), s), "fp8 prefill dense scratch free");
         return;
       }
     }
@@ -3337,4 +3400,44 @@ struct Registrar {
 } registrar;
 
 }  // namespace
+
+// ─── Test seams for the scratch-ownership cases ─────────────────────────────
+// Declared by `tests/vt/test_ops_paged_attn.cpp` (the same arrangement as the
+// FA2 decode seams). A CPU-only build never compiles this file, and the test
+// supplies inline no-op stubs so its cases still compile there.
+namespace testing {
+
+void SetFp8DenseIdentityAllocFailureForTesting(bool fail) {
+  std::atomic<int>& failpoints = Fp8DenseFailpoints();
+  if (fail) failpoints.fetch_or(kFp8DenseFailIdentityAlloc, std::memory_order_relaxed);
+  else failpoints.fetch_and(~kFp8DenseFailIdentityAlloc, std::memory_order_relaxed);
+}
+
+void SetFp8DenseIdentityCopyFailureForTesting(bool fail) {
+  std::atomic<int>& failpoints = Fp8DenseFailpoints();
+  if (fail) failpoints.fetch_or(kFp8DenseFailIdentityCopy, std::memory_order_relaxed);
+  else failpoints.fetch_and(~kFp8DenseFailIdentityCopy, std::memory_order_relaxed);
+}
+
+void ClearFp8DenseFailureForTesting() {
+  Fp8DenseFailpoints().store(0, std::memory_order_relaxed);
+}
+
+// Bytes currently in use in the CUDA memory pool the scratch is allocated from.
+// The release cases bracket one call with this: a buffer the guard did not free
+// keeps its bytes counted after the stream drains, so the observed value stays
+// above the pre-call one. A failed query throws rather than reporting 0, which
+// would make the comparison pass vacuously.
+size_t Fp8DensePoolUsedBytesForTesting() {
+  int device = 0;
+  Check(cudaGetDevice(&device), "pool used: cudaGetDevice");
+  cudaMemPool_t pool = nullptr;
+  Check(cudaDeviceGetMemPool(&pool, device), "pool used: cudaDeviceGetMemPool");
+  size_t used = 0;
+  Check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used),
+        "pool used: cudaMemPoolGetAttribute");
+  return used;
+}
+
+}  // namespace testing
 }  // namespace vt::cuda

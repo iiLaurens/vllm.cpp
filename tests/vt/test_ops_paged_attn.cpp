@@ -53,6 +53,25 @@ size_t Fa2DecodeScratchShapeCountForTesting(int device, void* stream);
 }  // namespace vt::cuda::testing
 #endif
 
+// The scratch-ownership seams behind the fp8 dense-prefill block of
+// `LaunchPagedFp8Out` (cuda_paged_attn.cu). The CUDA build defines them; a
+// CPU-only build cannot link them, so the inline no-op stubs keep the
+// release-on-unwind case COMPILED there (it skips at runtime through HasCuda),
+// the same reason the FA2 seams above are declared in this TU.
+namespace vt::cuda::testing {
+#ifdef VLLM_CPP_CUDA
+void SetFp8DenseIdentityAllocFailureForTesting(bool fail);
+void SetFp8DenseIdentityCopyFailureForTesting(bool fail);
+void ClearFp8DenseFailureForTesting();
+size_t Fp8DensePoolUsedBytesForTesting();
+#else
+inline void SetFp8DenseIdentityAllocFailureForTesting(bool /*fail*/) {}
+inline void SetFp8DenseIdentityCopyFailureForTesting(bool /*fail*/) {}
+inline void ClearFp8DenseFailureForTesting() {}
+inline size_t Fp8DensePoolUsedBytesForTesting() { return 0; }
+#endif
+}  // namespace vt::cuda::testing
+
 using vt::AttentionArgs;
 using vt::AttentionWindow;
 using vt::Backend;
@@ -1157,6 +1176,92 @@ TEST_CASE("paged_attention CUDA fp8-KV prefill (one-time dense dequant) matches 
     max_abs = std::max(max_abs, std::abs(static_cast<double>(got[i]) - ref[i]));
   MESSAGE("fp8-KV dense prefill max_abs_err vs f32 ref = " << max_abs);
   CHECK(max_abs < 5e-2);
+}
+
+// ===========================================================================
+// fp8-KV PREFILL scratch ownership: the dense scratch and the identity table
+// live only for the duration of one dispatch, and the steps that can throw
+// between the two cudaMallocAsync calls (the identity copy, the dequant launch,
+// the bf16 dispatch it feeds, the vectors between them) must not strand either
+// buffer. The two injections below are failures a healthy device never produces
+// on demand; each pass proves the memory pool gives the bytes back after the
+// exception unwinds, and that the propagated exception is the Check that
+// failed rather than something a destructor raised in its place.
+// ===========================================================================
+TEST_CASE("paged_attention CUDA fp8-KV prefill returns both scratch buffers to the pool when a later step throws") {
+  if (!HasCuda()) {
+    MESSAGE("no CUDA backend; skipping fp8-KV scratch release (dgx-pending)");
+    return;
+  }
+  const int64_t Hq = 2, Hk = 1, D = 256, block_size = 4;
+  const float scale = std::pow(static_cast<float>(D), -0.5f);
+  const std::vector<int32_t> qsl = {0, 4, 10};
+  const std::vector<int32_t> seq_lens = {4, 6};
+  const int64_t num_tokens = 10, num_reqs = 2, num_blocks = 4, max_blocks = 2;
+  auto q = RandF32(static_cast<size_t>(num_tokens * Hq * D), 7);
+  auto kv = RandF32(static_cast<size_t>(num_blocks * block_size * Hk * D), 11);
+  std::vector<uint8_t> cache(kv.size());
+  for (size_t i = 0; i < kv.size(); ++i) cache[i] = vt::StoreKvFp8E4M3(kv[i], 1.0f);
+  std::vector<int32_t> block_table = {0, 1, 2, 3};
+
+  const int64_t within = block_size * Hk * D;
+  std::vector<uint8_t> combined(static_cast<size_t>(num_blocks * 2 * within), 0);
+  for (int64_t b = 0; b < num_blocks; ++b)
+    for (int64_t e = 0; e < within; ++e) {
+      combined[static_cast<size_t>((b * 2 + 0) * within + e)] =
+          cache[static_cast<size_t>(b * within + e)];
+      combined[static_cast<size_t>((b * 2 + 1) * within + e)] =
+          cache[static_cast<size_t>(b * within + e)];
+    }
+
+  Backend& gpu = vt::GetBackend(DeviceType::kCUDA);
+  QueueGuard g(gpu);
+  DeviceTensor dq(gpu, g.q, DType::kF32, {num_tokens, Hq, D}, q.data());
+  DeviceTensor dcache(gpu, g.q, DType::kI8, {num_blocks * 2 * within}, combined.data());
+  auto SliceView = [&](int which) {
+    Tensor t = dcache.tensor();
+    t.data = static_cast<char*>(t.data) +
+             static_cast<size_t>(which) * static_cast<size_t>(within) * vt::SizeOf(DType::kI8);
+    t.rank = 4;
+    t.shape[0] = num_blocks;
+    t.shape[1] = block_size;
+    t.shape[2] = Hk;
+    t.shape[3] = D;
+    t.stride[0] = 2 * within;
+    t.stride[1] = Hk * D;
+    t.stride[2] = D;
+    t.stride[3] = 1;
+    return t;
+  };
+  Tensor kview = SliceView(0);
+  Tensor vview = SliceView(1);
+  DeviceTensor dbt(gpu, g.q, DType::kI32, {num_reqs, max_blocks}, block_table.data());
+  DeviceTensor dsl(gpu, g.q, DType::kI32, {num_reqs}, seq_lens.data());
+  DeviceTensor dqsl(gpu, g.q, DType::kI32, {num_reqs + 1}, qsl.data());
+  DeviceTensor dout(gpu, g.q, DType::kF32, {num_tokens, Hq, D});
+  PagedAttentionArgs args{scale, true};
+  args.kv_cache_dtype = vt::Fp8KVCacheDataType::kFp8E4M3;
+  args.k_scale = 1.0f;
+  args.v_scale = 1.0f;
+
+  auto pass = [&](const char* what, const char* expected) {
+    CAPTURE(what);
+    const size_t used_before = vt::cuda::testing::Fp8DensePoolUsedBytesForTesting();
+    CHECK_THROWS_WITH_AS(
+        vt::PagedAttention(g.q, dout.tensor(), dq.tensor(), kview, vview, dbt.tensor(),
+                           dsl.tensor(), dqsl.tensor(), args),
+        doctest::Contains(expected), std::runtime_error);
+    vt::cuda::testing::ClearFp8DenseFailureForTesting();
+    gpu.Synchronize(g.q);
+    CHECK(vt::cuda::testing::Fp8DensePoolUsedBytesForTesting() == used_before);
+  };
+
+  // (1) The identity-table allocation throws after the dense scratch exists.
+  vt::cuda::testing::SetFp8DenseIdentityAllocFailureForTesting(true);
+  pass("identity allocation", "fp8 prefill identity table:");
+  // (2) The identity-table copy throws after BOTH allocations succeeded.
+  vt::cuda::testing::SetFp8DenseIdentityCopyFailureForTesting(true);
+  pass("identity copy", "fp8 prefill identity table H2D:");
 }
 
 // ===========================================================================

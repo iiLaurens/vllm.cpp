@@ -16,4 +16,12 @@ MEASURED on the 27B NVFP4 arm at 8k prefill: 28.0s with the fp8 KV cache against
 
 ## Resolution
 
--
+- 2026-09-30: review repairs on the W1 PR (mudler/vllm.cpp#3360). The dense bf16
+  scratch and the identity table are owned by stream-aware scope guards, so the
+  steps that can throw between the two allocations (identity copy, dequant
+  launch, the bf16 dispatch, the vectors between them) release both buffers on
+  the same stream. A new case in `test_ops_paged_attn` injects the identity
+  allocation failure and the identity copy failure and checks the CUDA pool's
+  used bytes return to the pre-call value without the guard masking the
+  original exception. The benchmark header no longer claims a bf16 parity
+  comparison it does not perform; parity is gated by the test suite.

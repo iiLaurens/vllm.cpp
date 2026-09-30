@@ -32,6 +32,11 @@ shipped bf16 dispatch on it:
 - The scratch is **one block per request with `block_size = max_seq` and an
   identity block table**, so the kernel's paged address IS the dense address and
   no attention kernel changes.
+- Each scratch allocation is owned by a scope guard from the moment it
+  succeeds. The identity allocation and copy, the dequant launch, the bf16
+  dispatch it feeds, and the vectors between them can all throw, and the guard
+  frees on the SAME stream, so the free is ordered behind the work that reads
+  the buffer. The success path still checks its own frees explicitly.
 - The new shared `KvCachePresentsBf16` helper presents bf16 for an fp8 store, so
   FA-2 admits with zero cast kernels. It is model-agnostic: any model that gains
   an fp8 store inherits the CUDA path unchanged.
@@ -55,7 +60,12 @@ cost is `benchmarks/paged_attn_prefill_ab.cpp`, landed with this change.
 `tests/vt/test_ops_paged_attn.cpp` gains the fp8-dense parity case: the fp8 cache
 against the f32 reference at **1.9e-6 max abs err** — the exact dequantized
 values, tighter than the bf16-compute envelope — with the rest of the 33-case
-suite unchanged.
+suite unchanged. A second case injects the two failures a healthy device cannot
+produce on demand (the identity-table allocation, and the identity-table copy
+after both allocations succeeded) and asserts that the CUDA memory pool's used
+bytes return to their pre-call value after the exception unwinds. It also
+asserts the propagated message is the failing `Check`, so the guard's destructor
+cannot mask the original exception.
 
 ## What this does NOT claim
 
@@ -82,3 +92,5 @@ suite unchanged.
   in one binary, and the recipe written into `docs/BENCHMARKS.md`.
 - A `sm_120a` re-measurement: the author's numbers are from the local consumer
   card, and the fleet gate model runs elsewhere.
+- Execution of the scratch-ownership case, which needs a CUDA device; the CUDA
+  lane is its gate.

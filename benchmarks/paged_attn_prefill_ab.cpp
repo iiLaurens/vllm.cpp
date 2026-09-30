@@ -12,8 +12,11 @@
 //   BENCH_KV=fp8 VT_ATTN_FP8_DENSE=0   per-read dequant inside the kernel
 //   BENCH_KV=bf16 BENCH_DENSE=1        dense bf16 + identity table (layout control)
 //
-// Every arm is verified against the bf16 paged arm (max abs err printed), so a
-// fast arm cannot be fast by being wrong.
+// ONE arm per process, so this binary cannot compare arms to each other. It
+// prints a checksum of the arm's output, which makes a wildly wrong arm visible
+// in the logs; it is not a parity gate. Parity is gated by
+// `tests/vt/test_ops_paged_attn.cpp`, where each arm is compared against an f32
+// reference on the exact dequantized values (< 5e-2 max abs err).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
