@@ -16,4 +16,11 @@ A dense forward that owns a device embedding table pays [vocab, H] of device mem
 
 ## Resolution
 
--
+- 2026-09-30: review repairs on the W1 PR (mudler/vllm.cpp#3356). The host arm's
+  async-id override now routes through the shared `detail::ApplyDeviceTokenIds`
+  body instead of its own unchecked Copy, so an override longer than the embed
+  input is refused rather than written past the `[T]` buffer; two cases in
+  `tests/vllm/models/test_host_embedding.cpp` pin the oversized refusal and the
+  shorter-prefix tail preservation. The test's global initializer uses the
+  portable `vllm_test::SetEnv` (`tests/support/test_env.h`) instead of POSIX
+  `::setenv`, which an unconditional target cannot compile under MSVC.

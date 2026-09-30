@@ -49,7 +49,7 @@ owned both arms.
 |---|---|
 | The seam and the flag | `include/vllm/model_executor/models/host_embedding.h`, `src/vllm/model_executor/models/host_embedding.cpp` |
 | The wake-up call sites | the Qwen3.5 family, MuseGlimmer, the shared Qwen3 dense driver, and the classic dense families (Gemma 1-4, GLM4, Granite, MiniCPM 1/3, OLMo2, OPT, Phi, Phi3, StableLM, Command-R, DeepSeek-V2, GLM-MoE-DSA, Dots3-Note, Nemotron-H, Voxtral) |
-| The async id override consumed before the gather | `src/vllm/model_executor/models/qwen3_5_internal.h` (`detail::TakeDeviceTokenIds`) |
+| The async id override consumed before the gather | `src/vllm/model_executor/models/qwen3_5_internal.h` (`detail::TakeDeviceTokenIds`, then `detail::ApplyDeviceTokenIds` for the splice) |
 | The documented knobs | `docs/ENVIRONMENT.md` (`VT_HOST_EMBEDDING`, `VT_HOST_EMBED_TRACE`) |
 | Build registration | the new TU in `CMakeLists.txt` |
 
@@ -76,7 +76,11 @@ forward makes when it owns a device table. It owns both arms:
    staging buffer is copied to `out`.
    - The async runner may have spliced this step's sampled token into a
      device-resident ids buffer, so the host arm consumes
-     `detail::TakeDeviceTokenIds()` and reads the ids back before the gather.
+     `detail::TakeDeviceTokenIds()` and reads the ids back before the gather. The
+     splice runs through the same `detail::ApplyDeviceTokenIds` body the device
+     arm uses, so an override longer than the embed input is refused with the
+     caller's name instead of writing past the `[T]` buffer, and a SHORTER
+     override replaces exactly its prefix while the padded host tail stays.
    - `VT_HOST_EMBED_TRACE=1` prints the arm and `T`.
    - The flag is read ONCE per process (a function-static), so a serving process
      cannot switch arms mid-run; a same-binary A/B is two processes.
@@ -115,6 +119,7 @@ forward makes when it owns a device table. It owns both arms:
 | The flag is process-static, so a test binary cannot exercise both arms | The test binary enables it before `main` and is flag-ON by construction; the off arm is a plain early return and every other model suite runs it |
 | `d_dev == nullptr` does not prove the arm ran on the CPU backend | `ResidentWeight` aliases host bytes when `is_cpu()`, so the test captures the one-shot `[host-embed]` banner and checks `HostEmbedInto`'s return value; the mutation that disables the arm makes 4 assertions fail |
 | The host table's bytes are released by another path | The host arm declines on `bytes.empty()` / `host_released`, and `EmbedGather` then takes the device arm; the decline is a test case |
+| The runner and the model disagree about this step's row count | The override's count is bounded against the embed input by `detail::ApplyDeviceTokenIds` on BOTH arms; a longer override throws with `what` naming the caller, a shorter one is the padded case and keeps the host upload's tail. Two test cases pin the boundary |
 
 ## Evidence
 
@@ -122,6 +127,9 @@ forward makes when it owns a device table. It owns both arms:
   device op is gated on; the arm is proven to have run (captured banner + return
   value), not merely to have produced right numbers.
 - The table is never uploaded on the host arm (`d_dev == nullptr`).
+- The async override's shape is bounded: a longer-than-`T` override throws, and a
+  shorter one splices its prefix over the host upload while preserving the tail
+  (`tests/vllm/models/test_host_embedding.cpp`, the two override cases).
 - `tests/vt/test_ops_embedding_quant` (6/6, 1637 assertions) is unchanged.
 
 ## Gates

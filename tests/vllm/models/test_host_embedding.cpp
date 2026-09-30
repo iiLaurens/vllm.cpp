@@ -36,22 +36,27 @@
 #include "vllm/model_executor/models/dense_device_glue.h"  // Dev, DBuf
 #include "vllm/model_executor/models/host_embedding.h"  // HostEmbedInto, EmbedGather
 #include "vllm/model_executor/models/owned_bytes.h"
+#include "vllm/model_executor/models/qwen3_5_internal.h"  // detail::DeviceTokenIdsScope
 #include "vllm/model_executor/models/qwen3_5_weights.h"  // OwnedTensor
 #include "vt/dtype.h"
 #include "vt/ops.h"
 
+#include "support/test_env.h"
 #include "vt/iq4nl_q5_0_golden_vectors.h"
 
 namespace {
 
 struct EnableHostEmbedding {
   EnableHostEmbedding() {
-    ::setenv("VT_HOST_EMBEDDING", "1", 1);
+    // `support/test_env.h` is the portable setter (`_putenv_s` on MSVC): the
+    // unconditional POSIX `::setenv` this used to call does not compile in a
+    // CPU-only MSVC build, and this target is unconditional.
+    vllm_test::SetEnv("VT_HOST_EMBEDDING", "1");
     // The arm prints ONE banner per process (`logged`), so the first case is the
     // one that can read it. It is what proves the arm RAN: the CPU device arm
     // aliases the host bytes and sets no `d_dev`, so `d_dev == nullptr` alone
     // cannot tell the two arms apart on this backend.
-    ::setenv("VT_HOST_EMBED_TRACE", "1", 1);
+    vllm_test::SetEnv("VT_HOST_EMBED_TRACE", "1");
   }
 };
 const EnableHostEmbedding g_enable_host_embedding;
@@ -268,4 +273,76 @@ TEST_CASE("host embedding: a released host table declines the host arm") {
   // The boundary between the arms: the host arm must DECLINE, so `EmbedGather`
   // falls through to the device arm rather than gathering bytes that are gone.
   CHECK_FALSE(vllm::dense_attn::HostEmbedInto(d, out, ids, table, rows, k));
+}
+
+TEST_CASE("host embedding: a device override splices its rows over the host upload") {
+  constexpr int64_t k = 4;
+  constexpr int64_t rows = 3;
+  // Row r is the constant bf16(r + 1), so a resolved id is readable from the
+  // output bytes alone, with no second gather to trust.
+  std::vector<uint16_t> values(static_cast<size_t>(rows * k));
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t j = 0; j < k; ++j) {
+      values[static_cast<size_t>(r * k + j)] =
+          vt::F32ToBF16(static_cast<float>(r + 1));
+    }
+  }
+  vllm::OwnedTensor table =
+      HostTable(vt::DType::kBF16, rows, k, values.data(), values.size() * 2);
+
+  const std::vector<int32_t> host_ids{0, 1, 2};
+  // ONE id for the first row: the shared splice replaces exactly `count` rows,
+  // so the output must read [1, 1, 2]. The tail keeps the host upload's rows,
+  // which is the padded case a "replace everything" copy would break.
+  const std::vector<int32_t> override_ids{1};
+
+  vt::Queue q = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  vllm::dense_attn::DBuf out(d, vt::DType::kBF16, {3, k});
+
+  {
+    vllm::detail::DeviceTokenIdsScope scope(
+        override_ids.data(), static_cast<int64_t>(override_ids.size()));
+    CHECK(vllm::dense_attn::HostEmbedInto(d, out, host_ids, table, rows, k));
+  }
+
+  const auto* got = static_cast<const uint16_t*>(out.ptr());
+  const int32_t want[3] = {1, 1, 2};
+  for (int64_t t = 0; t < 3; ++t) {
+    for (int64_t j = 0; j < k; ++j) {
+      CAPTURE(t);
+      CAPTURE(j);
+      CHECK(got[static_cast<size_t>(t) * static_cast<size_t>(k) +
+                static_cast<size_t>(j)] ==
+            values[static_cast<size_t>(want[static_cast<size_t>(t)]) *
+                       static_cast<size_t>(k) +
+                   static_cast<size_t>(j)]);
+    }
+  }
+}
+
+TEST_CASE("host embedding: an override longer than the embed input is refused") {
+  constexpr int64_t k = 4;
+  constexpr int64_t rows = 2;
+  const std::vector<uint16_t> values(static_cast<size_t>(rows * k),
+                                     vt::F32ToBF16(1.0F));
+  vllm::OwnedTensor table =
+      HostTable(vt::DType::kBF16, rows, k, values.data(), values.size() * 2);
+
+  const std::vector<int32_t> host_ids{0};         // T = 1 row
+  const std::vector<int32_t> override_ids{1, 0};  // 2 > T
+
+  vt::Queue q = vt::GetBackend(vt::DeviceType::kCPU).CreateQueue();
+  vllm::dense_attn::Dev d{vt::GetBackend(q.device.type), q};
+  vllm::dense_attn::DBuf out(d, vt::DType::kBF16, {1, k});
+
+  vllm::detail::DeviceTokenIdsScope scope(
+      override_ids.data(), static_cast<int64_t>(override_ids.size()));
+  // The host upload is one row; splicing two would write past it. The device
+  // arm's shared `ApplyDeviceTokenIds` bounds the override and throws with the
+  // caller's name, and the host arm now routes through that same check instead
+  // of issuing its own unchecked Copy.
+  CHECK_THROWS_AS(
+      vllm::dense_attn::HostEmbedInto(d, out, host_ids, table, rows, k),
+      std::runtime_error);
 }

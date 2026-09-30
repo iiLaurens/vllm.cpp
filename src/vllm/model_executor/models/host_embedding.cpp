@@ -50,9 +50,17 @@ bool HostEmbedInto(Dev d, DBuf& hidden, const std::vector<int32_t>& token_ids,
   std::vector<int32_t> resolved = token_ids;
   const detail::DeviceTokenIds override_ids = detail::TakeDeviceTokenIds();
   if (override_ids.ids != nullptr) {
+    // The device arm below splices through `detail::ApplyDeviceTokenIds`, which
+    // bounds the override against the embed input and enqueues the Copy on the
+    // queue. The host arm must not keep a second, unchecked copy of that rule:
+    // a count larger than `T` means the runner and the model disagree about
+    // this step, and the raw Copy that used to sit here wrote past the T-row
+    // buffer instead of refusing. The helper also tolerates a SHORTER override,
+    // which is the padded case: the first `count` rows are replaced and the
+    // host upload's tail is preserved.
     DBuf dids(d, DType::kI32, {T}, token_ids.data());
-    d.b.Copy(d.q, dids.ptr(), override_ids.ids,
-             static_cast<size_t>(override_ids.count) * sizeof(int32_t));
+    detail::ApplyDeviceTokenIds(d.b, d.q, dids.ptr(), T, override_ids,
+                                "host embedding");
     dids.Download(d, resolved.data());
   }
   if (std::getenv("VT_HOST_EMBED_TRACE") != nullptr) {
