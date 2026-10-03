@@ -408,6 +408,8 @@ jobs:
           python3 tests/scripts/test_indextts2_emotion_arch_covered.py
           python3 tests/scripts/test_indextts2_pth_manifest.py
           python3 tests/scripts/test_indextts2_convert.py
+          python3 tests/scripts/test_convert_nimble.py
+          python3 tests/scripts/test_convert_clm.py
           python3 tests/scripts/test_indextts2_reference_path.py
           python3 tests/scripts/test_vocoder1d_single_home.py
       - name: Critical regression tests remain executable and CTest-registered
@@ -1279,8 +1281,8 @@ jobs:
           ./build-vulkan/tests/test_vulkan_backend \
             -tc="Vulkan platform is registered and reports unified/no-pool residency" -s \
             | tee vulkan-platform-case.log
-          grep -q 'kVULKAN Platform::get_device_capability() present=false' vulkan-platform-case.log
-          grep -q 'SelectAttentionBackendName(p) == "FLASH_ATTN" ) is correct' vulkan-platform-case.log
+          grep -q 'CHECK_FALSE( p.get_device_capability().present() ) is correct' vulkan-platform-case.log
+          grep -q 'CHECK( prio[0] == "FLASH_ATTN" ) is correct' vulkan-platform-case.log
           grep -qE 'test cases: *1 \| *1 passed' vulkan-platform-case.log
   device-leakage:
     # The DSR RATCHET (work row `S1` of .agents/specs/accelerator-seam-audit.md).
